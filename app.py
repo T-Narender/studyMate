@@ -31,11 +31,30 @@ from dotenv import load_dotenv
 import re
 import uuid
 import numpy as np
+import logging
+
+# Optional Hugging Face Inference client (used only if available and enabled)
+try:
+    from huggingface_hub import InferenceClient
+    HUGGINGFACE_HUB_AVAILABLE = True
+except Exception:
+    InferenceClient = None
+    HUGGINGFACE_HUB_AVAILABLE = False
 
 
 # Load environment variables from .env file
 load_dotenv()
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+
+# Setup basic logging
+logger = logging.getLogger("pdf_chat_assistant")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
 
 
 def extract_text_from_pdf(uploaded_file):
@@ -701,6 +720,89 @@ def rerank_chunks_with_embeddings(chunks, query, top_k=6, lambda_param=0.7, mode
     return selected
 
 
+def compute_reranker_scores(chunks, query, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    """Compute raw cosine similarity scores between chunks and query using embeddings.
+    Returns list of tuples (chunk, score) in descending score order.
+    """
+    if not chunks:
+        return []
+
+    texts = [c.page_content if hasattr(c, 'page_content') else str(c) for c in chunks]
+    try:
+        embedder = HuggingFaceEmbeddings(model_name=model_name)
+        # prefer document/query API when available
+        if hasattr(embedder, 'embed_documents'):
+            emb_docs = embedder.embed_documents(texts)
+            query_emb = embedder.embed_query(query)
+        else:
+            emb_docs = [embedder.embed_query(t) for t in texts]
+            query_emb = embedder.embed_query(query)
+    except Exception as e:
+        logger.exception("Embeddings failed in compute_reranker_scores")
+        return []
+
+    emb_matrix = np.array(emb_docs)
+    query_vec = np.array(query_emb)
+
+    def cos_sim(a, b):
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+
+    sims = [cos_sim(doc, query_vec) for doc in emb_matrix]
+    scored = list(zip(chunks, sims))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
+def generate_answer_with_hf_llm(query, chunks, model="HuggingFaceTB/SmolLM3-3B", max_tokens=300):
+    """Generate an answer using Hugging Face Inference API (safe wrapper).
+    `chunks` is a list of chunk-like objects with `page_content`.
+    Returns the text answer or None on failure.
+    """
+    if not HUGGINGFACE_HUB_AVAILABLE or not InferenceClient or not HF_TOKEN:
+        return None
+
+    # Build a compact context from chunks
+    try:
+        context_text = "\n\n".join([c.page_content for c in chunks if hasattr(c, 'page_content')])
+        prompt = f"Context:\n{context_text}\n\nQuestion: {query}\n\nProvide a concise, factual, and well-cited answer using only the context above. If answer is not in context, say you don't know."
+
+        client = InferenceClient(api_key=HF_TOKEN)
+
+        # Prefer chat completion if supported
+        try:
+            # Some InferenceClient variants expose chat completions differently
+            completion = client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}], max_tokens=max_tokens)
+            # Extract text conservatively
+            choice = completion.choices[0]
+            text = getattr(choice, 'message', {}).get('content') if hasattr(choice, 'message') else (choice.get('text') if isinstance(choice, dict) else None)
+            if not text:
+                # Try alternate fields
+                text = getattr(choice, 'text', None) or (choice.get('text') if isinstance(choice, dict) else None)
+        except Exception:
+            # Fallback to text generation api
+            completion = client.text_generation(model=model, inputs=prompt, max_new_tokens=max_tokens)
+            # Some clients return list-like structures
+            if isinstance(completion, list) and completion:
+                text = completion[0].get('generated_text') if isinstance(completion[0], dict) else str(completion[0])
+            elif isinstance(completion, dict):
+                text = completion.get('generated_text') or completion.get('text')
+            else:
+                text = str(completion)
+
+        if not text:
+            return None
+
+        # Remove any internal <think>...</think> markers and trim
+        clean_answer = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        return clean_answer
+    except Exception:
+        return None
+
+
 # Streamlit app configuration
 st.set_page_config(
     page_title="PDF Chat Assistant",
@@ -883,6 +985,13 @@ if uploaded_file is not None:
         if 'current_query' not in st.session_state:
             st.session_state.current_query = ""
 
+        # LLM options in UI: allow user to enable/disable remote LLM generation
+        use_llm = st.checkbox("Use LLM-based answer generation (Hugging Face Inference)", value=False)
+        llm_model = st.text_input("LLM model id (Hugging Face)", value="HuggingFaceTB/SmolLM3-3B", help="Model repo id to use on Hugging Face Inference API")
+        # Debugging / tuning controls
+        show_reranker_scores = st.checkbox("Show raw reranker scores (debug)", value=False)
+        max_context_chars = st.number_input("Max context chars to send to LLM", min_value=500, max_value=60000, value=4000, step=100)
+
         # Text input for questions
         user_query = st.text_input(
             "Ask any question about your PDF:",
@@ -919,10 +1028,43 @@ if uploaded_file is not None:
                             relevant_chunks = simple_text_search(st.session_state.chunks, user_query, max_results=6)
 
 
-                        # Generate comprehensive answer
+                        # Generate comprehensive answer — either via local extractive logic or remote LLM
+                        response = None
                         if relevant_chunks:
-                            response = generate_comprehensive_answer(user_query, relevant_chunks,
-                                                                     st.session_state.full_text)
+                            # If user opted into LLM and HF client & token are available, try LLM path first
+                            if use_llm and HUGGINGFACE_HUB_AVAILABLE and HF_TOKEN:
+                                try:
+                                    # Optionally show reranker scores
+                                    if show_reranker_scores:
+                                        scored = compute_reranker_scores(relevant_chunks, user_query)
+                                        with st.expander("🔎 Reranker scores"):
+                                            for i, (chunk, score) in enumerate(scored[:12], 1):
+                                                st.write(f"#{i} score={score:.4f} preview={chunk.page_content[:200].replace('\n',' ')}...")
+
+                                    # Trim context to max_context_chars before sending to LLM
+                                    trimmed_chunks = []
+                                    total = 0
+                                    for c in relevant_chunks:
+                                        text = c.page_content if hasattr(c, 'page_content') else str(c)
+                                        if total + len(text) > max_context_chars:
+                                            # add partial if space remains
+                                            remaining = max(0, max_context_chars - total)
+                                            if remaining > 50:
+                                                trimmed_chunks.append(type(c)(page_content=text[:remaining]) if hasattr(c, '__class__') else text[:remaining])
+                                            break
+                                        trimmed_chunks.append(c)
+                                        total += len(text)
+
+                                    llm_resp = generate_answer_with_hf_llm(user_query, trimmed_chunks, model=llm_model, max_tokens=300)
+                                    if llm_resp:
+                                        response = llm_resp
+                                except Exception as e:
+                                    logger.exception("LLM generation failed")
+                                    response = None
+
+                            # Fallback to extractive/rule-based answer if LLM disabled or failed
+                            if not response:
+                                response = generate_comprehensive_answer(user_query, relevant_chunks, st.session_state.full_text)
                         else:
                             response = "❌ No relevant content found for your query. Please try rephrasing your question or check if the content exists in the PDF."
 
