@@ -1,7 +1,10 @@
 import streamlit as st
 from PyPDF2 import PdfReader
 import pdfplumber
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+except Exception:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -99,21 +102,47 @@ def extract_text_from_pdf(uploaded_file):
 
 
 def clean_extracted_text(text):
-    """Clean and normalize extracted text"""
-    # Remove excessive whitespace
-    text = re.sub(r'\n\s*\n', '\n\n', text)
+    # Remove page markers
+    text = re.sub(r'--- Page \d+ ---', '', text)
 
-    # Fix common OCR/extraction issues
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # Add space between camelCase
-    text = re.sub(r'(\d+)([A-Za-z])', r'\1 \2', text)  # Space between numbers and letters
-    text = re.sub(r'([A-Za-z])(\d+)', r'\1 \2', text)  # Space between letters and numbers
+    # Fix line breaks
+    text = re.sub(r'\n+', '\n', text)
 
-    # Remove extra spaces
-    text = re.sub(r' +', ' ', text)
+    # Fix broken words
+    text = re.sub(r'-\n', '', text)
+
+    # Space fixes
+    text = re.sub(r'\s+', ' ', text)
+
+    # Remove junk symbols
+    text = re.sub(r'[•♦■►]', '', text)
 
     return text.strip()
 
 
+def assess_text_quality(text):
+    """Return a 0-1 score indicating how readable the extracted text is."""
+    if not text:
+        return 0.0
+
+    sample = text[:5000]
+    if not sample:
+        return 0.0
+
+    alpha = sum(ch.isalpha() for ch in sample)
+    spaces = sum(ch.isspace() for ch in sample)
+    total = len(sample)
+    weird = sum(not (ch.isalnum() or ch.isspace() or ch in ".,;:!?-()[]'\"") for ch in sample)
+
+    if total == 0:
+        return 0.0
+
+    alpha_ratio = alpha / total
+    space_ratio = spaces / total
+    weird_ratio = weird / total
+
+    score = alpha_ratio * 0.7 + space_ratio * 0.3 - weird_ratio
+    return max(0.0, min(1.0, score))
 def simple_text_search(chunks, query, max_results=6):
     """Improved fallback text search when vector store is not available"""
     if not chunks:
@@ -270,6 +299,382 @@ def generate_comprehensive_answer(query, relevant_chunks, full_context):
     # Default: comprehensive answer
     return format_comprehensive_response_improved(combined_content, query)
 
+def extract_relevant_snippet(text, query, window=2, max_chars=900):
+    """Extract the most relevant sentence snippet from text based on query terms."""
+    if not text:
+        return ""
+
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    if not sentences:
+        return text[:max_chars]
+
+    query_terms = extract_query_terms(query)
+    best_i = 0
+    best_score = -1
+
+    for i, sentence in enumerate(sentences):
+        s_lower = sentence.lower()
+        score = sum(s_lower.count(term) for term in query_terms)
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    start = max(0, best_i - window)
+    end = min(len(sentences), best_i + window + 1)
+    snippet = " ".join(sentences[start:end]).strip()
+
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars].rstrip() + "..."
+
+    return snippet
+
+
+def build_extractive_answer(query, relevant_chunks, max_chunks=3):
+    """Return verbatim excerpts from the most relevant chunks for higher accuracy."""
+    if not relevant_chunks:
+        return "❌ No relevant content found for your query. Please try rephrasing your question or check if the content exists in the PDF."
+
+    def format_answer_text(text):
+        # Drop noisy lecture references and empty lines
+        lines = [ln.strip() for ln in text.splitlines()]
+        cleaned = []
+        seen = set()
+        for ln in lines:
+            if not ln:
+                continue
+            if re.match(r'(?i)^refer\s+lec', ln):
+                continue
+            if re.match(r'(?i)^lec[-\s]?\d+', ln):
+                continue
+            if re.match(r'(?i)^codehelp', ln):
+                continue
+            if re.match(r'(?i)^what\s+is\s+dbms\s*\??$', ln):
+                continue
+            if len(ln) < 12:
+                continue
+            sig = re.sub(r'\s+', ' ', ln).lower()
+            if sig in seen:
+                continue
+            seen.add(sig)
+            cleaned.append(ln)
+
+        text = "\n".join(cleaned)
+
+        # Convert numbered lines to bullets
+        text = re.sub(r'(?m)^\d+\.\s*', '- ', text)
+        text = re.sub(r'(?m)^-\s*-', '- ', text)
+        text = re.sub(r'\s{2,}', ' ', text)
+        return text.strip()
+
+    def normalize_excerpt_text(text):
+        text = re.sub(r'---\s*Page\s*(\d+)\s*---', r'Page \1:', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Add missing spaces after punctuation/numbered lists
+        text = re.sub(r'(\d)\.(?=[A-Za-z])', r'\1. ', text)
+        text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)
+        text = re.sub(r'(\d+)\.\s*', r'\n\1. ', text)
+        return text
+
+    excerpts = []
+    for chunk in relevant_chunks[:max_chunks]:
+        content = chunk.page_content if hasattr(chunk, 'page_content') else str(chunk)
+        snippet = extract_relevant_snippet(content, query)
+        if snippet:
+            excerpts.append(normalize_excerpt_text(snippet))
+
+    if not excerpts:
+        return "❌ Could not extract relevant excerpts from the document."
+
+    response = "\n\n".join(excerpts[:max_chunks])
+    return format_answer_text(response)
+
+
+def extract_query_terms(query):
+    stop_words = {
+        "what", "why", "how", "explain", "describe", "define", "list", "give",
+        "tell", "about", "types", "type", "of", "the", "a", "an", "in", "to",
+        "and", "or", "with", "for", "on", "from", "as", "is", "are", "was"
+    }
+
+    terms = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2 and w not in stop_words]
+    return terms
+
+
+def score_chunk_for_query(chunk, terms):
+    text = chunk.page_content.lower() if hasattr(chunk, 'page_content') else str(chunk).lower()
+    score = sum(1 for t in terms if t in text)
+
+    # Boost for common DB/CS abbreviations
+    if "nosql" in terms and ("nosql" in text or "no sql" in text):
+        score += 2
+    if "acid" in terms and "acid" in text:
+        score += 2
+
+    return score
+
+
+def filter_low_quality_chunks(chunks, query):
+    terms = extract_query_terms(query)
+    if not terms:
+        return chunks
+
+    filtered = []
+    for c in chunks:
+        score = score_chunk_for_query(c, terms)
+        if score >= 1:
+            filtered.append(c)
+
+    # Sort by relevance score
+    filtered.sort(key=lambda c: score_chunk_for_query(c, terms), reverse=True)
+    return filtered
+
+
+def refine_chunks_by_topic(chunks, query):
+    """Narrow chunks for specific topics to avoid cross-topic contamination."""
+    q = query.lower()
+
+    # ACID-focused filtering
+    if "acid" in q:
+        keywords = ["acid", "atomicity", "consistency", "isolation", "durability"]
+        narrowed = []
+        for c in chunks:
+            text = c.page_content.lower() if hasattr(c, 'page_content') else str(c).lower()
+            if any(k in text for k in keywords):
+                narrowed.append(c)
+        if narrowed:
+            return narrowed
+
+    # NoSQL-focused filtering
+    if "nosql" in q or "no sql" in q:
+        keywords = ["nosql", "no sql", "document", "key-value", "wide-column", "graph"]
+        narrowed = []
+        for c in chunks:
+            text = c.page_content.lower() if hasattr(c, 'page_content') else str(c).lower()
+            if any(k in text for k in keywords):
+                narrowed.append(c)
+        if narrowed:
+            return narrowed
+
+    return chunks
+
+
+def validate_answer(answer, chunks):
+    hits = 0
+
+    for c in chunks:
+        text = c.page_content.lower() if hasattr(c, 'page_content') else str(c).lower()
+        if any(
+            word in text
+            for word in answer.lower().split()
+            if len(word) > 4
+        ):
+            hits += 1
+
+    return hits >= 2
+
+
+def reject_if_not_found(chunks, query):
+    # Reject only if none of the meaningful query terms appear in any chunk.
+    terms = extract_query_terms(query)
+    if not terms:
+        return False
+
+    for c in chunks:
+        text = c.page_content.lower() if hasattr(c, 'page_content') else str(c).lower()
+        hits = sum(1 for t in terms if t in text)
+        if "nosql" in terms and ("nosql" in text or "no sql" in text):
+            hits += 1
+        if hits >= 1:
+            return False
+
+    return True
+
+
+def build_definition_answer_from_chunks(query, chunks, max_lines=6):
+    """Build a cleaner definition-style answer for 'what is' / 'explain' queries."""
+    term_patterns = [
+        r'what is (.+?)(?:\?|$)',
+        r'explain (.+?)(?:\?|$)',
+        r'define (.+?)(?:\?|$)'
+    ]
+
+    term = None
+    q_lower = query.lower().strip()
+    for pattern in term_patterns:
+        match = re.search(pattern, q_lower)
+        if match:
+            term = match.group(1).strip()
+            break
+
+    if not term:
+        return None
+
+    collected = []
+    seen = set()
+    for c in chunks:
+        text = c.page_content if hasattr(c, 'page_content') else str(c)
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        for s in sentences:
+            s_clean = s.strip()
+            if len(s_clean) < 25:
+                continue
+            s_lower = s_clean.lower()
+            if term in s_lower and any(k in s_lower for k in [" is ", " means ", " refers", " defined"]):
+                sig = re.sub(r'\s+', ' ', s_lower)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                collected.append(s_clean)
+            if len(collected) >= max_lines:
+                break
+        if len(collected) >= max_lines:
+            break
+
+    if not collected:
+        return None
+
+    return "\n".join(f"- {line}" for line in collected[:max_lines])
+
+
+def build_simple_summary(text):
+    """Create a concise summary from full text using existing heuristics."""
+    if not text:
+        return "❌ No document text available to summarize."
+
+    try:
+        cleaned = re.sub(r'---\s*Page\s*\d+\s*---', ' ', text, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return extract_summary_content_improved(cleaned, "summary")
+    except Exception:
+        # Fallback: first few sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        short = " ".join(sentences[:10]).strip()
+        return f"## Summary/Overview:\n\n{short}" if short else "❌ No summary could be generated."
+
+
+def extract_definition_pairs(text, max_pairs=8):
+    pairs = []
+
+    if not text:
+        return pairs
+
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+    for line in lines:
+
+        if len(line) < 40:
+            continue
+
+        if ':' in line and line.count(':') == 1:
+
+            term, definition = line.split(':', 1)
+
+            term = term.strip()
+            definition = definition.strip()
+
+            if len(term.split()) > 5:
+                continue
+
+            if len(definition.split()) < 6:
+                continue
+
+            if any(x in term.lower() for x in ["lec", "unit", "page"]):
+                continue
+
+            pairs.append((term, definition))
+
+        if len(pairs) >= max_pairs:
+            break
+
+    # Fallback: "is" pattern
+    if len(pairs) < max_pairs:
+
+        sentences = re.split(r'[.!?]+', text)
+
+        for s in sentences:
+
+            s = s.strip()
+
+            if len(s) < 30:
+                continue
+
+            if " is " in s.lower():
+
+                parts = s.split(" is ", 1)
+
+                term = parts[0].strip()
+                definition = parts[1].strip()
+
+                if len(term.split()) <= 4 and len(definition.split()) >= 6:
+                    pairs.append((term, definition))
+
+            if len(pairs) >= max_pairs:
+                break
+
+    return pairs
+
+
+def build_quiz_from_pairs(pairs, max_q=5):
+    """Build short-answer quiz questions from definition pairs."""
+    if not pairs:
+        return "❌ Could not derive quiz questions from the document."
+
+    quiz = "### Quiz (Short Answer)\n\n"
+    for i, (term, definition) in enumerate(pairs[:max_q], 1):
+        if definition.lower().startswith(term.lower()):
+            definition = definition[len(term):].strip(' :.-')
+        quiz += f"**Q{i}.** Define {term}.\n\n"
+        quiz += f"**Answer:** {definition}\n\n"
+    return quiz
+
+
+def build_quiz_from_chunks(chunks, max_q=5):
+    """Generate a simple quiz by extracting clean, informative sentences."""
+    if not chunks:
+        return "❌ No relevant content found to build a quiz."
+
+    text = " ".join([c.page_content if hasattr(c, 'page_content') else str(c) for c in chunks])
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    questions = []
+    seen = set()
+
+    for s in sentences:
+        s = re.sub(r'\s+', ' ', s).strip()
+        if len(s) < 45 or len(s) > 180:
+            continue
+        if '?' in s:
+            continue
+        if s.lower().startswith("unit ") or s.lower().startswith("chapter "):
+            continue
+        sig = s[:80].lower()
+        if sig in seen:
+            continue
+        seen.add(sig)
+        questions.append(s)
+        if len(questions) >= max_q:
+            break
+
+    if not questions:
+        return "❌ Could not generate quiz questions from the document text."
+
+    quiz = "### Quiz (Short Answer)\n\n"
+    for i, s in enumerate(questions, 1):
+        quiz += f"**Q{i}.** Explain: {s}\n\n"
+        quiz += "**Answer:** (Write your response in your own words.)\n\n"
+
+    return quiz
+
+
+def build_flashcards_from_pairs(pairs, max_cards=6):
+    """Build flashcards from definition pairs."""
+    if not pairs:
+        return "❌ Could not derive flashcards from the document."
+
+    cards = "### Flashcards\n\n"
+    for i, (term, definition) in enumerate(pairs[:max_cards], 1):
+        cards += f"**Card {i}:** {term}\n\n"
+        cards += f"**Back:** {definition}\n\n"
+    return cards
 
 def merge_and_clean_chunks(chunks):
     """Merge chunks intelligently and remove duplicates"""
@@ -366,8 +771,6 @@ def extract_structural_content_improved(content, structure_type, number, query):
 
 
 def extract_definition_content_improved(content, query):
-    """Extract definitions with better context and formatting"""
-    # Try to identify what term is being asked about
     term_patterns = [
         r'what is (.+?)(?:\?|$)',
         r'define (.+?)(?:\?|$)',
@@ -383,34 +786,37 @@ def extract_definition_content_improved(content, query):
             break
 
     sentences = re.split(r'[.!?]+', content)
-    definition_content = []
+
+    definitions = []
 
     if term:
-        # Look for sentences containing the term with definitional context
-        for sentence in sentences:
-            sentence_clean = sentence.strip()
-            if not sentence_clean or len(sentence_clean) < 15:
+        for s in sentences:
+            s = s.strip()
+
+            if len(s) < 20:
                 continue
 
-            if term.lower() in sentence_clean.lower():
-                # Check if this looks like a definition
-                if any(indicator in sentence_clean.lower() for indicator in
-                       [':', 'is', 'means', 'refers', 'defined as']):
-                    definition_content.append(sentence_clean)
-                elif len(definition_content) < 3:  # Include context
-                    definition_content.append(sentence_clean)
+            s_lower = s.lower()
 
-    if definition_content:
-        result = f"## Definition/Explanation:\n\n"
-        result += "\n\n".join(definition_content[:6])
-        return result
-    else:
-        # Fallback: provide general content
-        meaningful_sentences = [s.strip() for s in sentences[:8] if len(s.strip()) > 20]
-        result = f"## Related Information:\n\n"
-        result += "\n\n".join(meaningful_sentences[:5])
+            if term in s_lower and any(
+                x in s_lower for x in [" is ", " means ", " defined", " refers"]
+            ):
+                definitions.append(s)
+
+    if definitions:
+        result = "## Definition:\n\n"
+        for d in definitions[:4]:
+            result += f"• {d}\n\n"
         return result
 
+    # Fallback
+    important = [s.strip() for s in sentences if len(s.strip()) > 25]
+
+    result = "## Related Information:\n\n"
+    for s in important[:5]:
+        result += f"• {s}\n\n"
+
+    return result
 
 def extract_list_content_improved(content, query):
     """Extract lists with better formatting and organization"""
@@ -502,39 +908,172 @@ def extract_procedure_content_improved(content, query):
 
 
 def extract_summary_content_improved(content, query):
-    """Extract summary with better content selection"""
-    sentences = re.split(r'[.!?]+', content)
-    summary_sentences = []
+    sentences = re.split(r'(?<=[.!?])\s+', content)
 
-    # Look for the most informative sentences
-    for sentence in sentences:
-        sentence_clean = sentence.strip()
-        if not sentence_clean or len(sentence_clean) < 20:
+    selected = []
+    seen = set()
+
+    def normalize_sentence(s):
+        def fix_broken_words(text):
+            stop_short = {"a", "an", "the", "is", "in", "of", "to", "as", "by", "or", "at", "be", "we", "us", "it", "on", "if", "do", "go", "no", "so", "he", "she", "am", "are", "was"}
+            tokens = text.split()
+            fixed = []
+            i = 0
+            while i < len(tokens):
+                t = tokens[i]
+                if i + 1 < len(tokens):
+                    n = tokens[i + 1]
+                    if t.isalpha() and n.isalpha():
+                        if len(n) <= 2 and n.lower() not in stop_short:
+                            t = t + n
+                            i += 1
+                        elif len(t) <= 2 and t.lower() not in stop_short:
+                            t = t + n
+                            i += 1
+                fixed.append(t)
+                i += 1
+            return " ".join(fixed)
+
+        s = re.sub(r'\s+', ' ', s).strip()
+        s = re.sub(r'\[[^\]]+\]', '', s)  # Remove bracketed citations
+        s = re.sub(r'\([^)]*\)', '', s)  # Remove parenthetical noise
+        s = re.sub(r'\s*-\s*', ' ', s)  # Remove dash fragments
+        s = re.sub(r'\b(i{1,3}|iv|v)\.\b', '', s, flags=re.IGNORECASE)
+        s = fix_broken_words(s)
+        s = s.strip(' .:-')
+        if not s.endswith('.'):
+            s = s + '.'
+        return s
+
+    for s in sentences:
+        s = s.strip()
+        if len(s) < 35:
             continue
+        if s.lower().startswith("unit ") or s.lower().startswith("chapter "):
+            continue
+        if s.lower().startswith("page "):
+            continue
+        if s.count(',') > 6:
+            continue
+        s = normalize_sentence(s)
+        if len(s) < 35:
+            continue
+        sig = s[:80].lower()
+        if sig in seen:
+            continue
+        seen.add(sig)
+        selected.append(s)
 
-        # Prioritize sentences with key terms
-        if any(word in sentence_clean.lower() for word in
-               ['summary', 'overview', 'main', 'key', 'important', 'objective']):
-            summary_sentences.insert(0, sentence_clean)  # Put at beginning
-        elif len(summary_sentences) < 8:
-            summary_sentences.append(sentence_clean)
+    if not selected:
+        selected = [normalize_sentence(s) for s in sentences if len(s.strip()) > 30]
 
     result = "## Summary/Overview:\n\n"
-
-    if summary_sentences:
-        for sentence in summary_sentences[:8]:
-            result += f"• {sentence}\n\n"
-    else:
-        result += "No specific summary content found in the selected chunks."
+    for s in selected[:12]:
+        result += f"• {s}\n\n"
 
     return result
 
 
+def handle_generic_overview_query(query, full_text):
+    """Provide stable, relevant answers for generic overview questions."""
+    if not full_text:
+        return None
+
+    q = query.lower().strip()
+    summary_patterns = [
+        "summary", "overview", "summarize", "give the summary", "brief", "short summary"
+    ]
+    topic_patterns = [
+        "main topics", "topics covered", "main contents", "contents", "what is this document about",
+        "objectives"
+    ]
+
+    if any(p in q for p in summary_patterns):
+        return extract_summary_content_improved(full_text, query)
+
+    if any(p in q for p in topic_patterns):
+        topics = extract_available_topics(full_text)
+        if topics and topics[0] not in ["Document content not available", "No specific topics detected"]:
+            result = "## Main Topics\n\n"
+            for t in topics[:10]:
+                result += f"• {t}\n"
+            return result
+
+        # Fallback to a longer summary if topics are not detectable
+        return extract_summary_content_improved(full_text, query)
+
+    return None
+
+
+def simplify_answer(text):
+    prompt = f"""
+    Rewrite this in simple student-friendly language.
+    Use short sentences.
+    Avoid complex words.
+    Make it easy to remember.
+    Do not add any new information. Only rephrase the given text.
+
+    Text:
+    {text}
+    """
+
+    if HUGGINGFACE_HUB_AVAILABLE and HF_TOKEN and InferenceClient:
+        try:
+            client = InferenceClient(api_key=HF_TOKEN)
+            return client.text_generation(
+                model="HuggingFaceTB/SmolLM2-1.7B-Instruct",
+                inputs=prompt,
+                max_new_tokens=300,
+                temperature=0.2
+            )
+        except Exception:
+            return text
+
+    return text
+
+
+def generate_general_answer(query, model="HuggingFaceTB/SmolLM2-1.7B-Instruct", max_tokens=500):
+    """Generate a general answer when the PDF lacks relevant content."""
+    if not HUGGINGFACE_HUB_AVAILABLE or not InferenceClient or not HF_TOKEN:
+        return None
+
+    prompt = f"""
+You are a helpful tutor. Answer the question clearly and concisely.
+If you are unsure, say you are not sure.
+
+Question:
+{query}
+"""
+
+    try:
+        client = InferenceClient(api_key=HF_TOKEN)
+        response = client.text_generation(
+            model=model,
+            inputs=prompt,
+            max_new_tokens=max_tokens,
+            temperature=0.2
+        )
+        return response.strip()
+    except Exception:
+        return None
+
+
 def format_comprehensive_response_improved(content, query):
-    """Format a comprehensive response for better presentation"""
-    formatted_response = f"### Response to: {query}\n\n"
-    formatted_response += content
-    return formatted_response
+
+    return f"""
+## 📘 Answer: {query}
+
+### ✅ Simple Explanation
+{content}
+
+### 📌 Key Points
+• Read carefully  
+• Focus on concepts  
+• Use examples  
+
+### 📝 Exam Tip
+Revise this topic twice before exams.
+"""
 
 
 
@@ -618,7 +1157,7 @@ def extract_available_topics(full_text):
     lines = full_text.split('\n')
     seen_topics = set()
 
-    for line in lines[:50]:  # Check first 50 lines for topics
+    for line in lines[:80]:  # Check first 80 lines for topics
         line_clean = line.strip()
         if not line_clean or len(line_clean) < 10:
             continue
@@ -646,11 +1185,26 @@ def extract_available_topics(full_text):
 
         # Add unique topics
         for topic in patterns_found:
-            topic_clean = topic.strip()
+            topic_clean = re.sub(r'\s+', ' ', topic).strip()
+            topic_clean = re.sub(r'[•*-]\s*', '', topic_clean).strip()
+            topic_clean = topic_clean.strip(':-')
+
+            # Filter noisy fragments
+            if any(bad in topic_clean.lower() for bad in ["lec", "page", "unit", "chapter", "come to some conclusion"]):
+                continue
+            if topic_clean.lower().startswith("e ") or topic_clean.lower().startswith("e."):
+                continue
+            if topic_clean.endswith("that"):
+                continue
+
+            # Normalize case for short titles
+            if len(topic_clean) <= 60:
+                topic_clean = topic_clean[0].upper() + topic_clean[1:]
+
             if (len(topic_clean) > 5 and
                     len(topic_clean) < 100 and
                     topic_clean not in seen_topics and
-                    len(topic_clean.split()) <= 12):
+                    len(topic_clean.split()) <= 10):
                 seen_topics.add(topic_clean)
                 topics.append(topic_clean)
 
@@ -757,49 +1311,51 @@ def compute_reranker_scores(chunks, query, model_name="sentence-transformers/all
     return scored
 
 
-def generate_answer_with_hf_llm(query, chunks, model="HuggingFaceTB/SmolLM3-3B", max_tokens=300):
-    """Generate an answer using Hugging Face Inference API (safe wrapper).
-    `chunks` is a list of chunk-like objects with `page_content`.
-    Returns the text answer or None on failure.
+def generate_answer_with_hf_llm(query, chunks, model="HuggingFaceTB/SmolLM2-1.7B-Instruct", max_tokens=700):
+    """
+    Improved RAG Prompt for higher accuracy.
+    Uses a more capable 'Instruct' model by default.
     """
     if not HUGGINGFACE_HUB_AVAILABLE or not InferenceClient or not HF_TOKEN:
         return None
-
-    # Build a compact context from chunks
     try:
-        context_text = "\n\n".join([c.page_content for c in chunks if hasattr(c, 'page_content')])
-        prompt = f"Context:\n{context_text}\n\nQuestion: {query}\n\nProvide a concise, factual, and well-cited answer using only the context above. If answer is not in context, say you don't know."
+        # Build a robust context block
+        context_text = ""
+        for i, c in enumerate(chunks):
+            content = c.page_content if hasattr(c, 'page_content') else str(c)
+            context_text += f"[Source {i+1}]: {content}\n\n"
+
+        # Refined Prompt Engineering
+        prompt = f"""<|system|>
+You are an expert academic assistant. Use the provided Context to answer the User Question. 
+Guidelines:
+1. If the answer isn't in the context, say "I cannot find this in the document."
+2. Use professional, clear language.
+3. Refer to sources as [Source X].
+4. Do not make up facts.
+<|end|>
+<|user|>
+Context:
+{context_text}
+
+Question: {query}
+<|end|>
+<|assistant|>"""
 
         client = InferenceClient(api_key=HF_TOKEN)
 
-        # Prefer chat completion if supported
-        try:
-            # Some InferenceClient variants expose chat completions differently
-            completion = client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}], max_tokens=max_tokens)
-            # Extract text conservatively
-            choice = completion.choices[0]
-            text = getattr(choice, 'message', {}).get('content') if hasattr(choice, 'message') else (choice.get('text') if isinstance(choice, dict) else None)
-            if not text:
-                # Try alternate fields
-                text = getattr(choice, 'text', None) or (choice.get('text') if isinstance(choice, dict) else None)
-        except Exception:
-            # Fallback to text generation api
-            completion = client.text_generation(model=model, inputs=prompt, max_new_tokens=max_tokens)
-            # Some clients return list-like structures
-            if isinstance(completion, list) and completion:
-                text = completion[0].get('generated_text') if isinstance(completion[0], dict) else str(completion[0])
-            elif isinstance(completion, dict):
-                text = completion.get('generated_text') or completion.get('text')
-            else:
-                text = str(completion)
+        # Using text_generation with specific stop sequences for higher precision
+        response = client.text_generation(
+            model=model,
+            inputs=prompt,
+            max_new_tokens=max_tokens,
+            temperature=0.1,
+            stop_sequences=["<|end|>", "User:"]
+        )
 
-        if not text:
-            return None
-
-        # Remove any internal <think>...</think> markers and trim
-        clean_answer = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-        return clean_answer
-    except Exception:
+        return response.strip()
+    except Exception as e:
+        logger.error(f"LLM Error: {e}")
         return None
 
 
@@ -810,8 +1366,99 @@ st.set_page_config(
     layout="wide"
 )
 
+# Custom UI styling
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: radial-gradient(1200px 800px at 10% -10%, rgba(99,102,241,0.18), transparent 60%),
+                    radial-gradient(900px 600px at 110% 0%, rgba(14,165,233,0.12), transparent 55%);
+    }
+    .hero {
+        background: linear-gradient(135deg, rgba(30,41,59,0.85), rgba(15,23,42,0.92));
+        border: 1px solid rgba(148,163,184,0.2);
+        border-radius: 18px;
+        padding: 22px 26px;
+        margin: 8px 0 18px 0;
+        box-shadow: 0 10px 30px rgba(2,6,23,0.35);
+    }
+    .hero-title {
+        font-size: 30px;
+        font-weight: 800;
+        margin-bottom: 6px;
+    }
+    .hero-sub {
+        color: rgba(226,232,240,0.85);
+        font-size: 15px;
+    }
+    .card {
+        background: rgba(15,23,42,0.7);
+        border: 1px solid rgba(148,163,184,0.16);
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 6px 18px rgba(2,6,23,0.25);
+    }
+    .question-bubble {
+        display: inline-block;
+        max-width: 90%;
+        padding: 10px 16px;
+        margin: 6px 0 12px 0;
+        border-radius: 999px;
+        background: rgba(30,41,59,0.8);
+        border: 1px solid rgba(148,163,184,0.2);
+        font-weight: 600;
+    }
+    .answer-wrap {
+        border-left: 3px solid rgba(56,189,248,0.7);
+        padding-left: 14px;
+        margin-top: 6px;
+    }
+    .section-title {
+        font-weight: 700;
+        font-size: 18px;
+        margin-bottom: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-weight: 600;
+        padding: 10px 16px;
+    }
+    .stButton > button {
+        border-radius: 10px;
+        padding: 8px 14px;
+        border: 1px solid rgba(148,163,184,0.25);
+    }
+    .stFileUploader, .stTextInput, .stNumberInput, .stTextArea {
+        background: rgba(2,6,23,0.15);
+        border-radius: 12px;
+    }
+    .question-card {
+        margin-top: 10px;
+        margin-bottom: 12px;
+        border: 1px solid rgba(148,163,184,0.22);
+        background: rgba(15,23,42,0.65);
+        border-radius: 14px;
+        padding: 14px 16px;
+    }
+    .search-label {
+        font-size: 18px;
+        font-weight: 700;
+        margin-bottom: 6px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 # Main title
-st.title("📘 Universal PDF Chat - Ask Your PDF Anything")
+st.markdown(
+    """
+    <div class="hero">
+        <div class="hero-title">📘 Universal PDF Chat — Ask Your PDF Anything</div>
+        <div class="hero-sub">Accurate answers, smart summaries, quizzes, and flashcards powered by your document.</div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 # Sidebar for file upload
 with st.sidebar:
@@ -841,6 +1488,8 @@ if 'chunks' not in st.session_state:
     st.session_state.chunks = None
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'text_quality' not in st.session_state:
+    st.session_state.text_quality = None
 
 # Process uploaded file
 if uploaded_file is not None:
@@ -863,18 +1512,24 @@ if uploaded_file is not None:
                 # Store full text for fallback searches
                 st.session_state.full_text = raw_text
 
+                # Assess text quality (detect OCR/garbled extraction)
+                st.session_state.text_quality = assess_text_quality(raw_text)
+                if st.session_state.text_quality < 0.55:
+                    st.warning(
+                        "⚠️ The extracted text looks low quality (likely scanned/OCR). "
+                        "Answers may be inaccurate. For best results, use a text-based PDF or OCR the file first."
+                    )
                 # Display text extraction success
                 st.success(f"✅ Successfully extracted {len(raw_text)} characters from PDF")
 
                 # Split into chunks with optimized parameters
                 splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=800,  # Slightly larger chunks for better context
-                    chunk_overlap=150,  # More overlap for continuity
-                    separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""],
-                    length_function=len,
-                    keep_separator=True
+                    chunk_size=900,
+                    chunk_overlap=250,
+                    separators=["\n\n", "\n", ". ", "? ", "! "]
                 )
                 chunks = splitter.split_text(raw_text)
+                st.session_state.chunks = chunks
 
                 if not chunks:
                     st.error("❌ Could not create text chunks from the PDF.")
@@ -888,7 +1543,7 @@ if uploaded_file is not None:
                     if FAISS_AVAILABLE and not vector_store_created:
                         try:
                             embeddings = HuggingFaceEmbeddings(
-                                model_name="sentence-transformers/all-MiniLM-L6-v2"
+                                model_name="sentence-transformers/all-mpnet-base-v2"
                             )
                             st.session_state.vector_store = FAISS.from_texts(
                                 chunks,
@@ -903,7 +1558,7 @@ if uploaded_file is not None:
                     if CHROMA_AVAILABLE and not vector_store_created:
                         try:
                             embeddings = HuggingFaceEmbeddings(
-                                model_name="sentence-transformers/all-MiniLM-L6-v2"
+                                model_name="sentence-transformers/all-mpnet-base-v2"
                             )
                             collection_name = f"pdf_{uuid.uuid4().hex[:8]}"
                             st.session_state.vector_store = Chroma.from_texts(
@@ -935,11 +1590,13 @@ if uploaded_file is not None:
                 st.write("- Check if the PDF contains readable text (not just images)")
                 st.stop()
 
-    # Show interface only after processing is complete
-    if st.session_state.processing_complete:
+    # Show interface after upload; disable inputs until processing is complete
+    if uploaded_file is not None:
         # Question interface
         st.header("💬 Ask Questions About Your PDF")
 
+        if not st.session_state.processing_complete:
+            st.info("Processing your PDF. The question box will enable when ready.")
         # Provide example questions based on document content
         if st.session_state.full_text:
             col1, col2 = st.columns([1, 1])
@@ -985,6 +1642,11 @@ if uploaded_file is not None:
         if 'current_query' not in st.session_state:
             st.session_state.current_query = ""
 
+        answer_mode = st.selectbox(
+            "Answer style",
+            ["Comprehensive (merged summary)", "Extractive (verbatim snippets)"],
+            index=0
+        )
         # LLM options in UI: allow user to enable/disable remote LLM generation
         use_llm = st.checkbox("Use LLM-based answer generation (Hugging Face Inference)", value=False)
         llm_model = st.text_input("LLM model id (Hugging Face)", value="HuggingFaceTB/SmolLM3-3B", help="Model repo id to use on Hugging Face Inference API")
@@ -992,13 +1654,23 @@ if uploaded_file is not None:
         show_reranker_scores = st.checkbox("Show raw reranker scores (debug)", value=False)
         max_context_chars = st.number_input("Max context chars to send to LLM", min_value=500, max_value=60000, value=4000, step=100)
 
+        st.markdown(
+            """
+            <div class="question-card">
+                <div class="search-label">Ask any question about your PDF</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
         # Text input for questions
         user_query = st.text_input(
-            "Ask any question about your PDF:",
+            "Search",
             value=st.session_state.current_query,
-            placeholder="e.g., What are the topics in Unit 1?",
+            placeholder="Type your question here...",
             help="Ask anything about the content of your PDF document",
-            key="query_input"
+            key="query_input",
+            disabled=not st.session_state.processing_complete
         )
 
         # Clear the session state query after displaying it
@@ -1007,101 +1679,97 @@ if uploaded_file is not None:
 
         # Process the query
         if user_query and user_query.strip():
+            if not st.session_state.processing_complete:
+                st.warning("Please wait until PDF processing finishes.")
+                st.stop()
+            if st.session_state.text_quality is not None and st.session_state.text_quality < 0.45:
+                st.error(
+                    "The extracted text is too garbled to answer reliably. "
+                    "Please upload a text-based PDF or run OCR on the document."
+                )
+                st.stop()
             if st.session_state.vector_store or st.session_state.chunks:
-                with st.spinner("🔍 Searching and analyzing..."):
+                with st.spinner("🧠 Analyzing document for the most accurate answer..."):
                     try:
-                        # Use vector search if available, otherwise use simple text search
+                        # Handle generic overview questions with stable answers
+                        overview_resp = handle_generic_overview_query(user_query, st.session_state.full_text)
+                        if overview_resp:
+                            st.subheader("📝 Answer:")
+                            st.markdown(overview_resp)
+                            st.stop()
+
+                        # 1. Retrieval: Hybrid search (vector + keyword)
                         if st.session_state.vector_store:
-                            # Search for relevant chunks using vector similarity
-                            matching_chunks = st.session_state.vector_store.similarity_search(
+                            vector_results = st.session_state.vector_store.similarity_search(
                                 user_query,
-                                k=12  # Get more chunks initially for better selection
+                                k=15
                             )
-                            # Re-rank the initial matches using embeddings + MMR for better relevance/diversity
-                            try:
-                                relevant_chunks = rerank_chunks_with_embeddings(matching_chunks, user_query, top_k=6)
-                            except Exception:
-                                # Fallback to improved heuristic scoring if reranker fails
-                                relevant_chunks = find_most_relevant_chunks(matching_chunks, user_query, max_chunks=6)
+
+                            keyword_results = simple_text_search(
+                                st.session_state.chunks,
+                                user_query,
+                                max_results=10
+                            )
+
+                            matching_chunks = list({id(c): c for c in vector_results + keyword_results}.values())
+
+                            relevant_chunks = rerank_chunks_with_embeddings(
+                                matching_chunks,
+                                user_query,
+                                top_k=6,
+                                lambda_param=0.7
+                            )
                         else:
-                            # Fallback to simple text search
-                            relevant_chunks = simple_text_search(st.session_state.chunks, user_query, max_results=6)
+                            relevant_chunks = simple_text_search(st.session_state.chunks, user_query, max_results=10)
 
+                        # Remove low-quality chunks
+                        relevant_chunks = filter_low_quality_chunks(relevant_chunks, user_query)
 
-                        # Generate comprehensive answer — either via local extractive logic or remote LLM
-                        response = None
-                        if relevant_chunks:
-                            # If user opted into LLM and HF client & token are available, try LLM path first
-                            if use_llm and HUGGINGFACE_HUB_AVAILABLE and HF_TOKEN:
-                                try:
-                                    # Optionally show reranker scores
-                                    if show_reranker_scores:
-                                        scored = compute_reranker_scores(relevant_chunks, user_query)
-                                        with st.expander("🔎 Reranker scores"):
-                                            for i, (chunk, score) in enumerate(scored[:12], 1):
-                                                st.write(f"#{i} score={score:.4f} preview={chunk.page_content[:200].replace('\n',' ')}...")
+                        # Topic-aware refinement to avoid cross-topic leakage
+                        relevant_chunks = refine_chunks_by_topic(relevant_chunks, user_query)
 
-                                    # Trim context to max_context_chars before sending to LLM
-                                    trimmed_chunks = []
-                                    total = 0
-                                    for c in relevant_chunks:
-                                        text = c.page_content if hasattr(c, 'page_content') else str(c)
-                                        if total + len(text) > max_context_chars:
-                                            # add partial if space remains
-                                            remaining = max(0, max_context_chars - total)
-                                            if remaining > 50:
-                                                trimmed_chunks.append(type(c)(page_content=text[:remaining]) if hasattr(c, '__class__') else text[:remaining])
-                                            break
-                                        trimmed_chunks.append(c)
-                                        total += len(text)
+                        # 2. Generation: Extract -> LLM -> Validate
+                        definition_answer = build_definition_answer_from_chunks(user_query, relevant_chunks)
+                        base_answer = definition_answer or build_extractive_answer(
+                            user_query,
+                            relevant_chunks,
+                            max_chunks=8
+                        )
 
-                                    llm_resp = generate_answer_with_hf_llm(user_query, trimmed_chunks, model=llm_model, max_tokens=300)
-                                    if llm_resp:
-                                        response = llm_resp
-                                except Exception as e:
-                                    logger.exception("LLM generation failed")
-                                    response = None
+                        response = base_answer
+                        if use_llm:
+                            # Only rewrite the extracted answer to avoid hallucinations
+                            rewritten = simplify_answer(base_answer)
+                            if rewritten:
+                                response = rewritten
 
-                            # Fallback to extractive/rule-based answer if LLM disabled or failed
-                            if not response:
-                                response = generate_comprehensive_answer(user_query, relevant_chunks, st.session_state.full_text)
-                        else:
-                            response = "❌ No relevant content found for your query. Please try rephrasing your question or check if the content exists in the PDF."
+                        # Auto-reject unknown questions (fallback to AI if enabled)
+                        if reject_if_not_found(relevant_chunks, user_query):
+                            if use_llm:
+                                fallback = generate_general_answer(user_query, model=llm_model, max_tokens=400)
+                                response = fallback or "❌ This information is not clearly present in the PDF."
+                            else:
+                                response = "❌ This information is not clearly present in the PDF."
+
+                        # Confidence validation: fallback to extracted answer if weak
+                        is_valid = validate_answer(response, relevant_chunks)
+                        if not is_valid:
+                            response = base_answer
 
                         # Display answer
-                        st.subheader("📝 Answer:")
+                        st.markdown(
+                            f"""
+                            <div class="question-bubble">{user_query}</div>
+                            <div class="card" style="margin-top: 8px;">
+                                <div class="section-title">📝 Answer</div>
+                                <div class="answer-wrap">
+                            """,
+                            unsafe_allow_html=True
+                        )
                         st.markdown(response)
+                        st.markdown("</div></div>", unsafe_allow_html=True)
 
-
-                        # Show confidence indicator
-                        if relevant_chunks:
-                            # Calculate simple confidence based on number of relevant chunks found
-                            confidence_score = len(relevant_chunks)
-
-                            if confidence_score >= 4:
-                                st.success("🎯 High confidence answer - Multiple relevant sources found")
-                            elif confidence_score >= 2:
-                                st.info("✅ Good match found - Some relevant content located")
-                            else:
-                                st.warning("⚠️ Limited match - Try being more specific")
-                        else:
-                            st.error("❌ No relevant content found")
-
-                            # Suggest alternative queries
-                            st.write("**💡 Try asking:**")
-                            fallback_suggestions = generate_query_suggestions(user_query, st.session_state.full_text)
-                            for suggestion in fallback_suggestions[:3]:
-                                st.write(f"- {suggestion}")
-
-                        # Show source chunks (optional)
-                        if relevant_chunks:
-                            with st.expander("📚 Source Content Used"):
-                                for i, chunk in enumerate(relevant_chunks[:3], 1):
-                                    st.write(f"**Source {i}:**")
-                                    preview = chunk.page_content[:300] + "..." if len(
-                                        chunk.page_content) > 300 else chunk.page_content
-                                    st.write(preview)
-                                    st.write("---")
+                        # Evidence, confidence, and source expander removed for a cleaner, chat-like response
 
                     except Exception as e:
                         st.error(f"❌ Error generating answer: {str(e)}")
@@ -1114,6 +1782,72 @@ if uploaded_file is not None:
             else:
                 st.error("❌ PDF not processed yet. Please wait for processing to complete.")
 
+        # Study Buddy tools
+        st.markdown("---")
+        st.header("🤖 AI-Powered Study Buddy")
+        st.write("Explain topics in simple terms, summarize notes, or generate quizzes/flashcards on demand.")
+
+        explain_tab, summary_tab, quiz_tab, flashcard_tab = st.tabs(
+            ["🧠 Explain Simply", "📝 Summarize Notes", "❓ Generate Quiz", "🧾 Flashcards"]
+        )
+
+        with explain_tab:
+            st.info("Use the main question box above to ask for explanations.")
+
+        with summary_tab:
+            if st.button("Summarize my notes", use_container_width=True, key="summary_btn"):
+                if not st.session_state.processing_complete:
+                    st.warning("Please wait until PDF processing finishes.")
+                else:
+                    with st.spinner("Generating summary..."):
+                        summary = build_simple_summary(st.session_state.full_text)
+                        st.markdown(summary)
+
+        with quiz_tab:
+            if st.button("Generate quiz", use_container_width=True, key="quiz_btn"):
+                if not st.session_state.processing_complete:
+                    st.warning("Please wait until PDF processing finishes.")
+                else:
+                    with st.spinner("Creating quiz questions..."):
+                        pairs = extract_definition_pairs(st.session_state.full_text, max_pairs=8)
+                        if len(pairs) < 3:
+                            st.warning("Not enough clean definitions found. Building a comprehension quiz from key sentences instead.")
+                            chunks = st.session_state.chunks or []
+                            quiz = build_quiz_from_chunks(chunks, max_q=5)
+                        else:
+                            quiz = build_quiz_from_pairs(pairs, max_q=5)
+                        st.markdown(quiz)
+
+        with flashcard_tab:
+            if st.button("Generate flashcards", use_container_width=True, key="flashcard_btn"):
+                if not st.session_state.processing_complete:
+                    st.warning("Please wait until PDF processing finishes.")
+                else:
+                    with st.spinner("Creating flashcards..."):
+                        pairs = extract_definition_pairs(st.session_state.full_text, max_pairs=10)
+                        if len(pairs) < 3:
+                            st.warning("Not enough clean definitions found. Try using a PDF with clearer headings/definitions, or enable LLM for generation.")
+                        cards = pairs[:6]
+                        if not cards:
+                            st.info("No flashcards available for this document.")
+                        else:
+                            cols = st.columns(2)
+                            for i, (term, definition) in enumerate(cards, 1):
+                                col = cols[(i - 1) % 2]
+                                with col:
+                                    st.markdown(
+                                        f"""
+                                        <div class="card" style="margin-bottom: 12px;">
+                                            <div class="section-title">Card {i}</div>
+                                            <div><strong>Front:</strong> {term}</div>
+                                            <details style="margin-top: 8px;">
+                                                <summary>Show answer</summary>
+                                                <div style="margin-top: 6px;"><strong>Back:</strong> {definition}</div>
+                                            </details>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
 elif uploaded_file is None:
     st.info("👆 Please upload a PDF file to get started!")
 
